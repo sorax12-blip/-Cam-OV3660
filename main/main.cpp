@@ -270,7 +270,7 @@ static uint16_t bleLiveHeight = 320;
 static uint8_t bleLiveJpegQuality = BLE_LIVE_DEFAULT_JPEG_QUALITY;
 static uint32_t bleLiveFrameIntervalMs = BLE_LIVE_DEFAULT_FRAME_INTERVAL_MS;
 
-static bool bleModeActive = false;
+static volatile bool bleModeActive = false;
 static volatile bool bleClientConnected = false;
 static volatile bool bleClientDisconnectedEvent = false;
 static BLEServer* bleServer = nullptr;
@@ -278,7 +278,7 @@ static BLECharacteristic* bleStatusCharacteristic = nullptr;
 static BLECharacteristic* bleDataCharacteristic = nullptr;
 static uint32_t blueLedLastToggleMs = 0;
 static bool blueLedState = false;
-static uint32_t bleAdvertisingStartedMs = 0;
+static volatile uint32_t bleAdvertisingStartedMs = 0;
 
 // Live preview exists only inside an active BLE session. Preview frames are
 // never written to the SD card and use the same BLE data characteristic as GET.
@@ -377,7 +377,6 @@ static void IRAM_ATTR onBleMomentaryButtonPressed();
 static bool consumeBleButtonPress();
 static bool startBluetoothBrowser();
 static void stopBluetoothBrowser();
-static void updateBluetoothBlueLed();
 static void processBluetoothCommands();
 static void bleSendStatus(const String& message);
 static void bleListPath(const String& path);
@@ -1497,7 +1496,6 @@ static void bleGetFile(const String& requestedPath) {
   uint32_t offset = 0;
   bool cancelled = false;
   while (f.available() && bleClientConnected && !usbHostConnected) {
-    updateBluetoothBlueLed();
     if (!bleModeActive) {
       cancelled = true;
       break;
@@ -1767,7 +1765,6 @@ static void bleUpdateLivePreview() {
   bool cancelled = false;
   while ((size_t)offset < liveJpegLen && bleClientConnected && bleModeActive &&
          bleLiveModeActive && !usbHostConnected) {
-    updateBluetoothBlueLed();
     size_t mtuPayload = blePayloadBytes();
     if (mtuPayload > sizeof(packet)) mtuPayload = sizeof(packet);
     if (mtuPayload <= BLE_LIVE_DATA_HEADER_BYTES) mtuPayload = 20;
@@ -2003,28 +2000,20 @@ static void stopBluetoothBrowser() {
   batteryEnterIdlePower();
 }
 
-static void updateBluetoothBlueLed() {
-  if (!bleModeActive) {
-    if (blueLedState) {
-      blueLedState = false;
+// Dedicated LED task keeps advertising blink at 4 Hz even when BLE setup,
+// file operations, or camera work block the Arduino loop.
+static void bluetoothLedTask(void*) {
+  for (;;) {
+    if (!bleModeActive) {
       digitalWrite(BLUE_BLE_LED_PIN, LOW);
-    }
-    return;
-  }
-
-  if (bleClientConnected) {
-    if (!blueLedState) {
-      blueLedState = true;
+    } else if (bleClientConnected) {
       digitalWrite(BLUE_BLE_LED_PIN, HIGH);
+    } else {
+      const uint32_t elapsed = millis() - bleAdvertisingStartedMs;
+      digitalWrite(BLUE_BLE_LED_PIN,
+                   ((elapsed / BLUE_LED_TOGGLE_MS) & 1U) ? HIGH : LOW);
     }
-    return;
-  }
-
-  const uint32_t now = millis();
-  if ((uint32_t)(now - blueLedLastToggleMs) >= BLUE_LED_TOGGLE_MS) {
-    blueLedLastToggleMs = now;
-    blueLedState = !blueLedState;
-    digitalWrite(BLUE_BLE_LED_PIN, blueLedState ? HIGH : LOW);
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
@@ -2062,6 +2051,9 @@ void setup() {
   digitalWrite(BLUE_BLE_LED_PIN, LOW);
   attachInterrupt(digitalPinToInterrupt(BLE_MOMENTARY_BUTTON_PIN),
                   onBleMomentaryButtonPressed, FALLING);
+
+  // Run the indicator independently of BLE/camera operations.
+  xTaskCreate(bluetoothLedTask, "ble_led", 2048, nullptr, 1, nullptr);
 
   Serial.begin(115200);
   Serial.println("\nESP32 Cam HD FULL exFAT - OV3660/OV5640 / motion stills / BLE Live / native USB MSC");
@@ -2113,7 +2105,6 @@ void loop() {
       bleStartRequested = true;
     }
   }
-  updateBluetoothBlueLed();
 
   // USB-C mass storage has priority over BLE. A request that arrives during a
   // comparison burst or SD photo write is handled after that operation returns.
@@ -2135,7 +2126,6 @@ void loop() {
   if (bleModeActive) {
     processBluetoothCommands();
     if (bleLiveModeActive) bleUpdateLivePreview();
-    updateBluetoothBlueLed();
 
     if (bleClientDisconnectedEvent && !bleClientConnected) {
       Serial.println("BLE client session ended; shutting Bluetooth off");
