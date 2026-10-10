@@ -219,13 +219,29 @@ static bool cameraPidUsesCurrentQxgaProfile(uint16_t pid) {
   return pid == OV3660_PID || pid == OV5640_PID;
 }
 
+static const uint8_t OV3660_EXIF_ORIENTATION_90_CW[] = {
+  0xFF, 0xE1, 0x00, 0x22,
+  0x45, 0x78, 0x69, 0x66, 0x00, 0x00,       // "Exif\0\0"
+  0x49, 0x49, 0x2A, 0x00,                   // little-endian TIFF header
+  0x08, 0x00, 0x00, 0x00,                   // IFD0 offset
+  0x01, 0x00,                               // one IFD entry
+  0x12, 0x01,                               // tag 0x0112: Orientation
+  0x03, 0x00,                               // type SHORT
+  0x01, 0x00, 0x00, 0x00,                   // count = 1
+  0x06, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00                    // no next IFD
+};
+
 // Native USB Mass Storage state. MSC is intentionally read-only.
 // Android/phone-first behavior: the SD medium is advertised as PRESENT from
 // the moment USB MSC starts so Android can mount it during initial enumeration.
 // Capture/BLE still pause as soon as the native USB host is mounted.
 static USBMSC usbMsc;
 static volatile bool usbHostConnected = false;
+static volatile bool usbEjectRequested = false;
 static bool usbMassStorageActive = false;
+static bool usbOwnsSdRaw = false;
+static FATFS* usbSavedFatFs = nullptr;
 static uint8_t usbSdPdrv = 0xFF;
 static uint32_t usbPhysicalSectors = 0;
 static uint16_t usbPhysicalSectorSize = 512;
@@ -378,6 +394,8 @@ static bool advanceToFreshFolderIfNeeded(const char* reason);
 // USB Mass Storage (read-only, exFAT-safe, physical-capacity-backed)
 // -------------------------------------------------------------------------
 static bool findUsbSdPhysicalDrive() {
+  if (!sdReady) return false;
+
   const uint32_t wantedSectors =
       (uint32_t)(SD_MMC.cardSize() / (uint64_t)SD_MMC.sectorSize());
   const uint16_t wantedSectorSize = (uint16_t)SD_MMC.sectorSize();
@@ -387,6 +405,7 @@ static bool findUsbSdPhysicalDrive() {
     WORD sectorSize = 0;
     if (disk_ioctl(pdrv, GET_SECTOR_COUNT, &sectors) != RES_OK) continue;
     if (disk_ioctl(pdrv, GET_SECTOR_SIZE, &sectorSize) != RES_OK) continue;
+
     if ((uint64_t)sectors == (uint64_t)wantedSectors &&
         sectorSize == wantedSectorSize) {
       usbSdPdrv = pdrv;
@@ -399,53 +418,29 @@ static bool findUsbSdPhysicalDrive() {
 }
 
 static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
-  ++usbMscReadOps;
-  if (!sdReady || usbSdPdrv == 0xFF || !buffer || bufsize == 0) {
-    ++usbMscReadFail;
-    return -1;
-  }
+  if (!usbMassStorageActive || !usbOwnsSdRaw || !buffer || bufsize == 0) return -1;
+  if (usbSdPdrv == 0xFF || usbPhysicalSectorSize == 0) return -1;
 
-  // A real block read proves that a USB host is present. This intentionally
-  // allows Android's very first probe instead of presenting an empty LUN.
-  usbHostConnected = true;
-
-  const uint32_t sectorSize = usbPhysicalSectorSize;
-  if (sectorSize == 0) {
-    ++usbMscReadFail;
-    return -1;
-  }
-
-  // Fast path: TinyUSB normally asks for one or more complete sectors.
-  if (offset == 0 && (bufsize % sectorSize) == 0) {
-    const uint32_t count = bufsize / sectorSize;
-    if ((uint64_t)lba + count > usbPhysicalSectors ||
-        disk_read(usbSdPdrv, static_cast<BYTE*>(buffer), lba, count) != RES_OK) {
-      ++usbMscReadFail;
-      return -1;
-    }
+  if (offset == 0 && (bufsize % usbPhysicalSectorSize) == 0) {
+    const uint32_t count = bufsize / usbPhysicalSectorSize;
+    if ((uint64_t)lba + count > usbPhysicalSectors) return -1;
+    if (disk_read(usbSdPdrv, static_cast<BYTE*>(buffer), lba, count) != RES_OK) return -1;
     return (int32_t)bufsize;
   }
 
-  // Safe fallback for an unaligned request.
   uint8_t sector[512];
-  if (sectorSize != sizeof(sector)) {
-    ++usbMscReadFail;
-    return -1;
-  }
-
-  uint64_t absolute = (uint64_t)lba * sectorSize + offset;
+  if (usbPhysicalSectorSize != sizeof(sector)) return -1;
+  uint64_t absolute = (uint64_t)lba * usbPhysicalSectorSize + offset;
   uint8_t* dst = static_cast<uint8_t*>(buffer);
   uint32_t remaining = bufsize;
-  while (remaining) {
-    const uint32_t sectorNumber = (uint32_t)(absolute / sectorSize);
-    const uint32_t inside = (uint32_t)(absolute % sectorSize);
-    if (sectorNumber >= usbPhysicalSectors ||
-        disk_read(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) {
-      ++usbMscReadFail;
-      return -1;
-    }
 
-    uint32_t chunk = sectorSize - inside;
+  while (remaining) {
+    const uint32_t sectorNumber = (uint32_t)(absolute / usbPhysicalSectorSize);
+    const uint32_t inside = (uint32_t)(absolute % usbPhysicalSectorSize);
+    if (sectorNumber >= usbPhysicalSectors) return -1;
+    if (disk_read(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) return -1;
+
+    uint32_t chunk = usbPhysicalSectorSize - inside;
     if (chunk > remaining) chunk = remaining;
     memcpy(dst, sector + inside, chunk);
     dst += chunk;
@@ -455,19 +450,58 @@ static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t 
   return (int32_t)bufsize;
 }
 
-static int32_t usbMscWrite(uint32_t, uint32_t, uint8_t*, uint32_t) {
-  // Final camera firmware intentionally exposes the card read-only. This keeps
-  // Android/PC from modifying raw exFAT sectors while the camera VFS is mounted.
-  return -1;
+static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+  if (!usbMassStorageActive || !usbOwnsSdRaw || !buffer || bufsize == 0) return -1;
+  if (usbSdPdrv == 0xFF || usbPhysicalSectorSize == 0) return -1;
+
+  if (offset == 0 && (bufsize % usbPhysicalSectorSize) == 0) {
+    const uint32_t count = bufsize / usbPhysicalSectorSize;
+    if ((uint64_t)lba + count > usbPhysicalSectors) return -1;
+    if (disk_write(usbSdPdrv, static_cast<const BYTE*>(buffer), lba, count) != RES_OK) return -1;
+    disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+    return (int32_t)bufsize;
+  }
+
+  uint8_t sector[512];
+  if (usbPhysicalSectorSize != sizeof(sector)) return -1;
+  uint64_t absolute = (uint64_t)lba * usbPhysicalSectorSize + offset;
+  const uint8_t* src = buffer;
+  uint32_t remaining = bufsize;
+
+  while (remaining) {
+    const uint32_t sectorNumber = (uint32_t)(absolute / usbPhysicalSectorSize);
+    const uint32_t inside = (uint32_t)(absolute % usbPhysicalSectorSize);
+    if (sectorNumber >= usbPhysicalSectors) return -1;
+    if (disk_read(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) return -1;
+
+    uint32_t chunk = usbPhysicalSectorSize - inside;
+    if (chunk > remaining) chunk = remaining;
+    memcpy(sector + inside, src, chunk);
+    if (disk_write(usbSdPdrv, sector, sectorNumber, 1) != RES_OK) return -1;
+
+    src += chunk;
+    absolute += chunk;
+    remaining -= chunk;
+  }
+
+  disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+  return (int32_t)bufsize;
 }
 
-static bool usbMscStartStop(uint8_t, bool, bool) {
+static bool usbMscStartStop(uint8_t, bool start, bool load_eject) {
+  if (!start && load_eject) {
+    if (usbSdPdrv != 0xFF) disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+    usbEjectRequested = true;
+  } else if (start) {
+    usbEjectRequested = false;
+  }
   return true;
 }
 
 static void usbEventCallback(void*, esp_event_base_t event_base,
                              int32_t event_id, void*) {
   if (event_base != ARDUINO_USB_EVENTS) return;
+
   switch (event_id) {
     case ARDUINO_USB_STARTED_EVENT:
       usbHostConnected = true;
@@ -493,10 +527,10 @@ static void usbMassStorageBegin() {
     return;
   }
 
-  Serial.printf("USB MSC backing device: pdrv=%u, %lu sectors x %u bytes (%.2f GiB)\n",
+  Serial.printf("USB MSC raw SD: pdrv=%u, %lu sectors x %u bytes (%.2f GiB physical)\n",
                 usbSdPdrv,
                 (unsigned long)usbPhysicalSectors,
-                (unsigned)usbPhysicalSectorSize,
+                usbPhysicalSectorSize,
                 ((double)usbPhysicalSectors * usbPhysicalSectorSize) /
                     (1024.0 * 1024.0 * 1024.0));
 
@@ -508,12 +542,13 @@ static void usbMassStorageBegin() {
 
   usbMsc.vendorID("ESP32");
   usbMsc.productID("CAM_HD_EXFAT");
-  usbMsc.productRevision("3.0");
+  usbMsc.productRevision("3.1");
   usbMsc.onRead(usbMscRead);
   usbMsc.onWrite(usbMscWrite);
   usbMsc.onStartStop(usbMscStartStop);
-  usbMsc.isWritable(false);
-  usbMsc.mediaPresent(true);
+  usbMsc.isWritable(true);
+  // Keep the LUN absent until the ESP32 filesystem has been cleanly unmounted.
+  usbMsc.mediaPresent(false);
 
   if (!usbMsc.begin(usbPhysicalSectors, usbPhysicalSectorSize)) {
     Serial.println("USB MSC initialization failed");
@@ -526,7 +561,7 @@ static void usbMassStorageBegin() {
     return;
   }
 
-  Serial.println("USB-C mass storage ready: exFAT / full physical card / READ-ONLY / direct USB-C supported");
+  Serial.println("USB-C mass storage ready: WRITABLE exFAT / exclusive SD ownership / direct USB-C supported");
 }
 
 static void enterUsbMassStorageMode() {
@@ -538,15 +573,74 @@ static void enterUsbMassStorageMode() {
     cameraReady = false;
   }
 
+  char drive[3] = {(char)('0' + usbSdPdrv), ':', 0};
+  DWORD freeClusters = 0;
+  FATFS* currentFatFs = nullptr;
+
+  if (disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr) != RES_OK) {
+    Serial.println("USB MSC ownership handoff failed: SD sync failed");
+    return;
+  }
+  if (f_getfree(drive, &freeClusters, &currentFatFs) != FR_OK || !currentFatFs) {
+    Serial.println("USB MSC ownership handoff failed: could not obtain mounted FatFs");
+    return;
+  }
+  if (f_mount(nullptr, drive, 0) != FR_OK) {
+    Serial.println("USB MSC ownership handoff failed: could not unmount ESP32 filesystem");
+    return;
+  }
+
+  usbSavedFatFs = currentFatFs;
+  sdReady = false;
+  usbOwnsSdRaw = true;
   usbMassStorageActive = true;
-  Serial.printf("USB host connected: capture PAUSED; exFAT SD exposed READ-ONLY (reads=%lu failures=%lu)\n",
-                (unsigned long)usbMscReadOps, (unsigned long)usbMscReadFail);
+  usbMsc.mediaPresent(true);
+
+  Serial.println("USB host connected: capture/BLE PAUSED; ESP32 filesystem UNMOUNTED");
+  Serial.println("USB host now has exclusive WRITABLE SD ownership (delete/write enabled)");
 }
 
 static void exitUsbMassStorageMode() {
-  if (!usbMassStorageActive || usbHostConnected) return;
+  if (!usbMassStorageActive) return;
+  if (usbHostConnected && !usbEjectRequested) return;
 
+  usbMsc.mediaPresent(false);
+  if (usbSdPdrv != 0xFF) disk_ioctl(usbSdPdrv, CTRL_SYNC, nullptr);
+
+  usbOwnsSdRaw = false;
   usbMassStorageActive = false;
+
+  char drive[3] = {(char)('0' + usbSdPdrv), ':', 0};
+  bool remounted = false;
+  if (usbSavedFatFs && f_mount(usbSavedFatFs, drive, 1) == FR_OK) {
+    if (!SD_MMC.exists(PHOTO_ROOT)) SD_MMC.mkdir(PHOTO_ROOT);
+    sdReady = SD_MMC.exists(PHOTO_ROOT);
+    remounted = sdReady;
+  }
+
+  if (!remounted) {
+    Serial.println("USB handoff: direct FatFs remount failed; restarting SD stack");
+    SD_MMC.end();
+    sdReady = false;
+    usbSavedFatFs = nullptr;
+    mountSD();
+    remounted = sdReady;
+    if (remounted && !findUsbSdPhysicalDrive()) {
+      Serial.println("USB handoff recovery warning: SD remounted but raw drive lookup failed");
+    }
+  }
+
+  usbSavedFatFs = nullptr;
+  usbEjectRequested = false;
+
+  if (!remounted) {
+    Serial.println("USB host disconnected/ejected: SD REMOUNT FAILED; capture remains paused");
+    batteryEnterIdlePower();
+    return;
+  }
+
+  // Host may have deleted or added photos, so rebuild the numbering state.
+  initializeMediaSequences();
 
   const uint32_t now = millis();
   if (captureMode == CAPTURE_MODE_EVENT) {
@@ -554,10 +648,10 @@ static void exitUsbMassStorageMode() {
     eventBlockStartedMs = now;
     eventPhotosThisBlock = 0;
     nextEventPhotoDueMs = now + EVENT_PHOTO_INTERVAL_MS;
-    Serial.println("USB host disconnected: EVENT capture resumes in 750 ms; 2-minute block restarted");
+    Serial.println("USB host disconnected/ejected: SD remounted; EVENT resumes in 750 ms; 2.5-minute block restarted");
   } else {
     nextMotionCheckDueMs = now + MOTION_CHECK_INTERVAL_MS;
-    Serial.println("USB host disconnected: MONITORING resumes; next 5-frame check in 10 seconds");
+    Serial.println("USB host disconnected/ejected: SD remounted; MONITORING resumes in 7.5 seconds");
   }
   batteryEnterIdlePower();
 }
@@ -926,10 +1020,25 @@ static bool capturePhoto() {
   File output = SD_MMC.open(fileName, FILE_WRITE);
   bool ok = false;
   if (output) {
-    const size_t written = output.write(frame->buf, frame->len);
+    size_t written = 0;
+    // EXIF Orientation 6 displays the landscape JPEG rotated 90 degrees clockwise.
+    // Pixel data is preserved, avoiding an expensive decode/re-encode.
+    if (detectedCameraSensor == CAMERA_SENSOR_OV3660 && frame->len >= 2 &&
+        frame->buf[0] == 0xFF && frame->buf[1] == 0xD8) {
+      const size_t a = output.write(frame->buf, 2);
+      const size_t b = output.write(OV3660_EXIF_ORIENTATION_90_CW,
+                                    sizeof(OV3660_EXIF_ORIENTATION_90_CW));
+      const size_t c = output.write(frame->buf + 2, frame->len - 2);
+      written = a + b + c;
+      ok = (a == 2 && b == sizeof(OV3660_EXIF_ORIENTATION_90_CW) &&
+            c == frame->len - 2);
+    } else {
+      written = output.write(frame->buf, frame->len);
+      ok = (written == frame->len);
+    }
     output.flush();
     output.close();
-    ok = (written == frame->len);
+    // Preserve the per-write success check above.
   }
 
   Serial.printf("%s %s (%ux%u, %u bytes)\n",
@@ -1584,6 +1693,37 @@ static void bleStopLivePreview(bool notifyClient) {
   Serial.println("BLE LIVE OFF: camera released; SD browser remains connected");
 }
 
+static void copyOv3660OrientedLiveJpegRange(const camera_fb_t* frame,
+                                           size_t logicalOffset,
+                                           uint8_t* dst,
+                                           size_t len) {
+  if (!frame || !dst || len == 0) return;
+
+  const size_t exifLen = sizeof(OV3660_EXIF_ORIENTATION_90_CW);
+  const size_t soiEnd = 2;
+  const size_t exifEnd = soiEnd + exifLen;
+
+  size_t out = 0;
+  while (out < len) {
+    const size_t pos = logicalOffset + out;
+    if (pos < soiEnd) {
+      const size_t chunk = min(len - out, soiEnd - pos);
+      memcpy(dst + out, frame->buf + pos, chunk);
+      out += chunk;
+    } else if (pos < exifEnd) {
+      const size_t exifPos = pos - soiEnd;
+      const size_t chunk = min(len - out, exifLen - exifPos);
+      memcpy(dst + out, OV3660_EXIF_ORIENTATION_90_CW + exifPos, chunk);
+      out += chunk;
+    } else {
+      const size_t srcPos = pos - exifLen;
+      const size_t chunk = min(len - out, frame->len - srcPos);
+      memcpy(dst + out, frame->buf + srcPos, chunk);
+      out += chunk;
+    }
+  }
+}
+
 static void bleUpdateLivePreview() {
   if (!bleLiveModeActive || !bleModeActive || !bleClientConnected || usbHostConnected) return;
 
@@ -1606,23 +1746,31 @@ static void bleUpdateLivePreview() {
     return;
   }
 
+  const bool orientLive90Cw =
+      detectedCameraSensor == CAMERA_SENSOR_OV3660 &&
+      frame->buf[0] == 0xFF && frame->buf[1] == 0xD8;
+  const size_t liveJpegLen =
+      frame->len + (orientLive90Cw ? sizeof(OV3660_EXIF_ORIENTATION_90_CW) : 0U);
+  const uint16_t liveDisplayWidth = orientLive90Cw ? frame->height : frame->width;
+  const uint16_t liveDisplayHeight = orientLive90Cw ? frame->width : frame->height;
+
   uint16_t frameId = ++bleLiveFrameId;
   if (frameId == 0) frameId = ++bleLiveFrameId; // reserve zero as invalid in the test viewer
-  bleSendStatus("BEGIN LIVE " + String(frameId) + " " + String((uint32_t)frame->len) +
-                " " + String(frame->width) + " " + String(frame->height) +
+  bleSendStatus("BEGIN LIVE " + String(frameId) + " " + String((uint32_t)liveJpegLen) +
+                " " + String(liveDisplayWidth) + " " + String(liveDisplayHeight) +
                 " " + String(bleLiveJpegQuality));
 
   uint8_t packet[244];
   uint32_t offset = 0;
   bool cancelled = false;
-  while (offset < frame->len && bleClientConnected && bleModeActive &&
+  while ((size_t)offset < liveJpegLen && bleClientConnected && bleModeActive &&
          bleLiveModeActive && !usbHostConnected) {
     updateBluetoothBlueLed();
     size_t mtuPayload = blePayloadBytes();
     if (mtuPayload > sizeof(packet)) mtuPayload = sizeof(packet);
     if (mtuPayload <= BLE_LIVE_DATA_HEADER_BYTES) mtuPayload = 20;
     const size_t payloadCapacity = mtuPayload - BLE_LIVE_DATA_HEADER_BYTES;
-    const size_t frameBytesRemaining = (size_t)frame->len - (size_t)offset;
+    const size_t frameBytesRemaining = liveJpegLen - (size_t)offset;
     const size_t wanted = (payloadCapacity < frameBytesRemaining)
                               ? payloadCapacity
                               : frameBytesRemaining;
@@ -1638,7 +1786,12 @@ static void bleUpdateLivePreview() {
     packet[3] = (uint8_t)(offset >> 8);
     packet[4] = (uint8_t)(offset >> 16);
     packet[5] = (uint8_t)(offset >> 24);
-    memcpy(packet + BLE_LIVE_DATA_HEADER_BYTES, frame->buf + offset, wanted);
+    if (orientLive90Cw) {
+      copyOv3660OrientedLiveJpegRange(frame, offset,
+                                     packet + BLE_LIVE_DATA_HEADER_BYTES, wanted);
+    } else {
+      memcpy(packet + BLE_LIVE_DATA_HEADER_BYTES, frame->buf + offset, wanted);
+    }
     bleDataCharacteristic->setValue(packet, wanted + BLE_LIVE_DATA_HEADER_BYTES);
     bleDataCharacteristic->notify();
     offset += (uint32_t)wanted;
@@ -1962,7 +2115,7 @@ void loop() {
 
   // USB-C mass storage has priority over BLE. A request that arrives during a
   // comparison burst or SD photo write is handled after that operation returns.
-  if (usbHostConnected) {
+  if (usbHostConnected && !usbEjectRequested) {
     if (bleModeActive) stopBluetoothBrowser();
     enterUsbMassStorageMode();
     if (!batteryActivePower) batteryEnterActivePower();
