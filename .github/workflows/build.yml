@@ -1,42 +1,71 @@
-name: Build OV3660 firmware
+name: Import dual-camera firmware and build OV3660
 
 on:
   workflow_dispatch:
   push:
-    branches: [main]
     paths:
-      - 'main/**'
-      - 'components/**'
-      - 'CMakeLists.txt'
-      - 'sdkconfig.defaults'
-      - 'partitions.csv'
       - '.github/workflows/build.yml'
+
+permissions:
+  contents: write
 
 jobs:
   firmware:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Check original ESP-IDF project exists
+      - name: Checkout OV3660 repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Import complete original ESP-IDF project
+        shell: bash
         run: |
-          test -f CMakeLists.txt || { echo "::error::Missing root CMakeLists.txt: upload original ESP-IDF project first"; exit 1; }
-          test -f main/CMakeLists.txt || { echo "::error::Missing main/CMakeLists.txt: upload original ESP-IDF project first"; exit 1; }
-      - name: Build with ESP-IDF 5.5.1
+          set -euo pipefail
+          git clone --depth 1 --branch ov3660-writable-msc https://github.com/sorax12-blip/Cam-v3-OV5640.git /tmp/dual-camera-source
+          SOURCE=/tmp/dual-camera-source/firmware/esp32-cam-hd-full-exfat
+          test -f "$SOURCE/CMakeLists.txt"
+          test -f "$SOURCE/main/main.cpp"
+          # Copy the full project, including any custom components and configs.
+          cp -a "$SOURCE/." ./
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("main/main.cpp")
+          s = p.read_text()
+          old = "static const int GREEN_STATUS_LED_PIN = 14;"
+          old_blue = "static const int BLUE_BLE_LED_PIN = 47;"
+          assert s.count(old) == 1, "Expected original green LED pin assignment not found"
+          assert s.count(old_blue) == 1, "Expected original blue LED pin assignment not found"
+          s = s.replace(old, "static const int GREEN_STATUS_LED_PIN = 41;")
+          s = s.replace(old_blue, "static const int BLUE_BLE_LED_PIN = 42;")
+          s = s.replace("Green LED GPIO14", "Green LED GPIO41")
+          s = s.replace("blue LED GPIO47", "blue LED GPIO42")
+          p.write_text(s)
+          assert "GREEN_STATUS_LED_PIN = 41;" in s
+          assert "BLUE_BLE_LED_PIN = 42;" in s
+          PY
+          git add -A
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Import original dual-camera ESP-IDF project for OV3660; switch LEDs to GPIO41/42'
+            git push
+          fi
+
+      - name: Compile ESP32-S3 firmware with ESP-IDF 5.5.5
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: v5.5.1
+          esp_idf_version: v5.5.5
           target: esp32s3
           path: '.'
-      - name: Package flashable images
-        if: success()
+
+      - name: Collect binaries
         run: |
           mkdir -p firmware-output
-          find build -maxdepth 2 -type f -name '*.bin' -exec cp '{}' firmware-output/ \;
+          find build -maxdepth 3 -type f -name '*.bin' -exec cp '{}' firmware-output/ \;
           cp build/flasher_args.json firmware-output/ 2>/dev/null || true
           test -n "$(find firmware-output -name '*.bin' -print -quit)"
+
       - name: Upload firmware artifacts
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: OV3660-firmware
+          name: OV3660-GPIO41-42-firmware
           path: firmware-output/
