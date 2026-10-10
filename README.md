@@ -1,18 +1,28 @@
-# Cam OV3660 firmware
+# ESP32 Cam HD — Full exFAT Firmware
 
-Dedicated OV3660 ESP32-S3 N16R8 firmware repository. The OV5640 project is separate.
+Full camera firmware built with ESP-IDF 5.5.5 + Arduino-ESP32 3.3.12.
 
-## Planned update
-- Green startup LED: GPIO41
-- Blue BLE LED: GPIO42
-- BLE Live web viewer: rotate 90° clockwise
-- Saved photo orientation and capture logic unchanged
+Storage:
+- exFAT microSD support
+- built-in 1-bit SDMMC: CLK 39, CMD 38, D0 40
+- physical card capacity exposed over native USB MSC
+- USB MSC is read-only in the full camera build
+- direct USB-C to USB-C is supported on the native USB-OTG connector
 
-## Build prerequisites
-The original final archive contains a single 80 KB `.cpp` source and compiled binaries, **not** the complete ESP-IDF project, including its project-local exFAT FatFs integration. The previously compiled binary does **not** contain the new LED pin assignments.
+Camera:
+- OV3660 / OV5640 PID auto-detect
+- QXGA 2048x1536 saved JPEG profile (shared temporary profile)
+- motion checks: 5 unsaved QQVGA comparison frames every 10 seconds
+- >=10% changed area starts event capture
+- event photos every 750 ms
+- event recheck every 2 minutes
 
-To build a valid new image, add the original ESP-IDF project tree at the repository root, including `CMakeLists.txt`, `main/CMakeLists.txt`, `sdkconfig.defaults` (if used), and the custom exFAT FatFs component and other dependencies. Replace the corresponding source with `ESP32_Cam_HD_FULL_EXFAT_SOURCE_LED41_42.cpp` from the supplied source package and retain the original component wiring.
+BLE:
+- ESP32 Cam HD
+- button GPIO21
+- blue LED GPIO47
+- Live default: HVGA 480x320, Q20, 250 ms target
+- capture pauses during BLE
 
-The web viewer is a separate HTML asset and does not require firmware compilation.
-
-GitHub Actions will run the ESP-IDF build and upload the generated `.bin` files after the full project is supplied. Do not flash a binary from a failed or unverified build.
+Startup:
+- green LED GPIO14 flashes 3 Hz for 5 seconds before capture starts
