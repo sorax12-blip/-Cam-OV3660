@@ -1,0 +1,42 @@
+name: Build OV3660 firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'main/**'
+      - 'components/**'
+      - 'CMakeLists.txt'
+      - 'sdkconfig.defaults'
+      - 'partitions.csv'
+      - '.github/workflows/build.yml'
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check original ESP-IDF project exists
+        run: |
+          test -f CMakeLists.txt || { echo "::error::Missing root CMakeLists.txt: upload original ESP-IDF project first"; exit 1; }
+          test -f main/CMakeLists.txt || { echo "::error::Missing main/CMakeLists.txt: upload original ESP-IDF project first"; exit 1; }
+      - name: Build with ESP-IDF 5.5.1
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.1
+          target: esp32s3
+          path: '.'
+      - name: Package flashable images
+        if: success()
+        run: |
+          mkdir -p firmware-output
+          find build -maxdepth 2 -type f -name '*.bin' -exec cp '{}' firmware-output/ \;
+          cp build/flasher_args.json firmware-output/ 2>/dev/null || true
+          test -n "$(find firmware-output -name '*.bin' -print -quit)"
+      - name: Upload firmware artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OV3660-firmware
+          path: firmware-output/
