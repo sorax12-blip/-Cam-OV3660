@@ -896,9 +896,12 @@ static void cameraBegin() {
   detectedCameraSensor = cameraModelFromPid(detectedCameraPid);
 
   if (detectedCameraSensor == CAMERA_SENSOR_OV3660) {
-    // Existing OV3660 orientation correction.
-    s->set_vflip(s, 1);
-    s->set_hmirror(s, 0);
+    // Installed OV3660 module is physically inverted relative to the previous
+    // sensor setting. Toggle BOTH axes for a 180-degree sensor rotation.
+    // Keep the existing EXIF Orientation 6 JPEG portrait presentation intact,
+    // so saved stills and BLE Live frames are corrected together.
+    s->set_vflip(s, 0);
+    s->set_hmirror(s, 1);
   } else if (detectedCameraSensor == CAMERA_SENSOR_OV5640) {
     // OV5640 is detected separately, but for now we intentionally keep the
     // same photo quality/resolution profile as the OV3660. Orientation stays
