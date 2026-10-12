@@ -132,7 +132,7 @@ static constexpr uint32_t GREEN_LED_OFF_MS = 167;
 // -------------------------------------------------------------------------
 
 // Motion / event capture timing.
-static constexpr uint32_t MOTION_CHECK_INTERVAL_MS = 10000;
+static constexpr uint32_t MOTION_CHECK_INTERVAL_MS = 7000;
 static constexpr uint8_t MOTION_COMPARE_FRAMES = 8;
 static constexpr float MOTION_TRIGGER_PERCENT = 2.0f;
 static constexpr uint8_t MOTION_CELL_BRIGHTNESS_DELTA = 18;
