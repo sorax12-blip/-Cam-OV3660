@@ -133,8 +133,8 @@ static constexpr uint32_t GREEN_LED_OFF_MS = 167;
 
 // Motion / event capture timing.
 static constexpr uint32_t MOTION_CHECK_INTERVAL_MS = 10000;
-static constexpr uint8_t MOTION_COMPARE_FRAMES = 5;
-static constexpr float MOTION_TRIGGER_PERCENT = 10.0f;
+static constexpr uint8_t MOTION_COMPARE_FRAMES = 8;
+static constexpr float MOTION_TRIGGER_PERCENT = 2.0f;
 static constexpr uint8_t MOTION_CELL_BRIGHTNESS_DELTA = 18;
 static constexpr uint32_t EVENT_PHOTO_INTERVAL_MS = 750;
 static constexpr uint32_t EVENT_RECHECK_INTERVAL_MS = 120000;
@@ -144,10 +144,10 @@ static constexpr uint32_t PHOTOS_PER_EVENT_BLOCK =
     EVENT_RECHECK_INTERVAL_MS / EVENT_PHOTO_INTERVAL_MS;
 
 // Comparison resolution/signature geometry. QQVGA is 160x120.
-static constexpr uint16_t MOTION_COMPARE_WIDTH = 160;
-static constexpr uint16_t MOTION_COMPARE_HEIGHT = 120;
-static constexpr uint8_t MOTION_SIG_WIDTH = 40;
-static constexpr uint8_t MOTION_SIG_HEIGHT = 30;
+static constexpr uint16_t MOTION_COMPARE_WIDTH = 320;
+static constexpr uint16_t MOTION_COMPARE_HEIGHT = 240;
+static constexpr uint16_t MOTION_SIG_WIDTH = 320;
+static constexpr uint16_t MOTION_SIG_HEIGHT = 180;
 static constexpr uint16_t MOTION_SIG_CELLS = MOTION_SIG_WIDTH * MOTION_SIG_HEIGHT;
 static constexpr uint8_t MOTION_COMPARE_JPEG_QUALITY = 20;
 
@@ -309,7 +309,7 @@ static uint32_t eventBlockStartedMs = 0;
 static uint32_t eventPhotosThisBlock = 0;
 
 // Comparison scratch storage. Five signatures use only 6000 bytes.
-static uint8_t motionSignatures[MOTION_COMPARE_FRAMES][MOTION_SIG_CELLS];
+static uint8_t* motionSignatures = nullptr;  // 8 x 320x180 signatures allocated in PSRAM
 static uint8_t* motionRgbBuffer = nullptr;
 
 // CPU power-state tracking.
@@ -1083,13 +1083,15 @@ static bool buildMotionSignature(const camera_fb_t* frame, uint8_t* signature) {
     return false;
   }
 
-  const uint16_t cellW = MOTION_COMPARE_WIDTH / MOTION_SIG_WIDTH;   // 4
-  const uint16_t cellH = MOTION_COMPARE_HEIGHT / MOTION_SIG_HEIGHT; // 4
+  // QVGA is 320x240. Analyze its centered 320x180 region without resizing.
+  const uint16_t cellW = 1;
+  const uint16_t cellH = 1;
+  const uint16_t cropTop = (MOTION_COMPARE_HEIGHT - MOTION_SIG_HEIGHT) / 2;
   for (uint16_t gy = 0; gy < MOTION_SIG_HEIGHT; ++gy) {
     for (uint16_t gx = 0; gx < MOTION_SIG_WIDTH; ++gx) {
       uint32_t sum = 0;
       for (uint16_t py = 0; py < cellH; ++py) {
-        const uint16_t y = gy * cellH + py;
+        const uint16_t y = cropTop + gy * cellH + py;
         for (uint16_t px = 0; px < cellW; ++px) {
           const uint16_t x = gx * cellW + px;
           const size_t i = ((size_t)y * MOTION_COMPARE_WIDTH + x) * 3U;
@@ -1144,8 +1146,16 @@ static bool runMotionComparison(float& averageChangedPercent, float& peakChanged
   if (!sensor) return false;
 
   batteryEnterActivePower();
-  if (sensor->set_framesize(sensor, FRAMESIZE_QQVGA) != 0) {
-    Serial.println("Motion compare failed: unable to set QQVGA");
+  if (!motionSignatures) {
+    motionSignatures = (uint8_t*)heap_caps_malloc((size_t)MOTION_COMPARE_FRAMES * MOTION_SIG_CELLS,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!motionSignatures) {
+      Serial.println("Motion compare failed: unable to allocate signature storage in PSRAM");
+      return false;
+    }
+  }
+  if (sensor->set_framesize(sensor, FRAMESIZE_QVGA) != 0) {
+    Serial.println("Motion compare failed: unable to set QVGA");
     return false;
   }
   sensor->set_quality(sensor, MOTION_COMPARE_JPEG_QUALITY);
@@ -1153,7 +1163,7 @@ static bool runMotionComparison(float& averageChangedPercent, float& peakChanged
   // Drain old full-resolution/idle frames. None of these are saved.
   flushCameraFrames(CAMERA_FB_COUNT);
 
-  Serial.println("Motion compare: capturing 5 unsaved frames...");
+  Serial.printf("Motion compare: capturing %u unsaved QVGA frames, analyzing 320x180 center...\n", (unsigned)MOTION_COMPARE_FRAMES);
   for (uint8_t n = 0; n < MOTION_COMPARE_FRAMES; ++n) {
     camera_fb_t* frame = esp_camera_fb_get();
     if (!frame) {
@@ -1161,7 +1171,7 @@ static bool runMotionComparison(float& averageChangedPercent, float& peakChanged
       configureSavedPhotoMode(true);
       return false;
     }
-    const bool ok = buildMotionSignature(frame, motionSignatures[n]);
+    const bool ok = buildMotionSignature(frame, motionSignatures + (size_t)n * MOTION_SIG_CELLS);
     esp_camera_fb_return(frame);
     if (!ok) {
       configureSavedPhotoMode(true);
@@ -1172,7 +1182,7 @@ static bool runMotionComparison(float& averageChangedPercent, float& peakChanged
   float sumPercent = 0.0f;
   Serial.print("Motion differences vs frame 1:");
   for (uint8_t n = 1; n < MOTION_COMPARE_FRAMES; ++n) {
-    const float pct = changedPercentBetweenSignatures(motionSignatures[0], motionSignatures[n]);
+    const float pct = changedPercentBetweenSignatures(motionSignatures, motionSignatures + (size_t)n * MOTION_SIG_CELLS);
     sumPercent += pct;
     if (pct > peakChangedPercent) peakChangedPercent = pct;
     Serial.printf(" %.1f%%", pct);
@@ -2061,8 +2071,8 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\nESP32 Cam HD FULL exFAT - OV3660/OV5640 / motion stills / BLE Live / native USB MSC");
   blinkGreenLedAtBoot();
-  Serial.printf("Motion monitor: 5 unsaved frames every %u sec; trigger >= %.1f%% changed area\n",
-                (unsigned)(MOTION_CHECK_INTERVAL_MS / 1000U), MOTION_TRIGGER_PERCENT);
+  Serial.printf("Motion monitor: %u unsaved frames every %u sec; trigger >= %.1f%% changed area\n",
+                (unsigned)MOTION_COMPARE_FRAMES, (unsigned)(MOTION_CHECK_INTERVAL_MS / 1000U), MOTION_TRIGGER_PERCENT);
   Serial.printf("Event mode: saved photo every %.2f sec; recheck every %u sec\n",
                 EVENT_PHOTO_INTERVAL_MS / 1000.0f,
                 (unsigned)(EVENT_RECHECK_INTERVAL_MS / 1000U));
