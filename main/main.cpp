@@ -147,7 +147,7 @@ static constexpr uint32_t PHOTOS_PER_EVENT_BLOCK =
 static constexpr uint16_t MOTION_COMPARE_WIDTH = 320;
 static constexpr uint16_t MOTION_COMPARE_HEIGHT = 240;
 static constexpr uint16_t MOTION_SIG_WIDTH = 320;
-static constexpr uint16_t MOTION_SIG_HEIGHT = 180;
+static constexpr uint16_t MOTION_SIG_HEIGHT = 240;
 static constexpr uint16_t MOTION_SIG_CELLS = MOTION_SIG_WIDTH * MOTION_SIG_HEIGHT;
 static constexpr uint8_t MOTION_COMPARE_JPEG_QUALITY = 20;
 
@@ -309,7 +309,7 @@ static uint32_t eventBlockStartedMs = 0;
 static uint32_t eventPhotosThisBlock = 0;
 
 // Comparison scratch storage. Five signatures use only 6000 bytes.
-static uint8_t* motionSignatures = nullptr;  // 8 x 320x180 signatures allocated in PSRAM
+static uint8_t* motionSignatures = nullptr;  // 8 x 320x240 signatures allocated in PSRAM
 static uint8_t* motionRgbBuffer = nullptr;
 
 // CPU power-state tracking.
@@ -1083,15 +1083,14 @@ static bool buildMotionSignature(const camera_fb_t* frame, uint8_t* signature) {
     return false;
   }
 
-  // QVGA is 320x240. Analyze its centered 320x180 region without resizing.
+  // Analyze the entire native QVGA 320x240 frame.
   const uint16_t cellW = 1;
   const uint16_t cellH = 1;
-  const uint16_t cropTop = (MOTION_COMPARE_HEIGHT - MOTION_SIG_HEIGHT) / 2;
   for (uint16_t gy = 0; gy < MOTION_SIG_HEIGHT; ++gy) {
     for (uint16_t gx = 0; gx < MOTION_SIG_WIDTH; ++gx) {
       uint32_t sum = 0;
       for (uint16_t py = 0; py < cellH; ++py) {
-        const uint16_t y = cropTop + gy * cellH + py;
+        const uint16_t y = gy * cellH + py;
         for (uint16_t px = 0; px < cellW; ++px) {
           const uint16_t x = gx * cellW + px;
           const size_t i = ((size_t)y * MOTION_COMPARE_WIDTH + x) * 3U;
@@ -1163,7 +1162,7 @@ static bool runMotionComparison(float& averageChangedPercent, float& peakChanged
   // Drain old full-resolution/idle frames. None of these are saved.
   flushCameraFrames(CAMERA_FB_COUNT);
 
-  Serial.printf("Motion compare: capturing %u unsaved QVGA frames, analyzing 320x180 center...\n", (unsigned)MOTION_COMPARE_FRAMES);
+  Serial.printf("Motion compare: capturing %u unsaved QVGA frames, analyzing full 320x240 frame...\n", (unsigned)MOTION_COMPARE_FRAMES);
   for (uint8_t n = 0; n < MOTION_COMPARE_FRAMES; ++n) {
     camera_fb_t* frame = esp_camera_fb_get();
     if (!frame) {
